@@ -9,11 +9,12 @@ docs/design.md 7.1 ("mock HTTP responses / dependencies, no real network").
 from __future__ import annotations
 
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
 from synology_api.exceptions import FileStationError
 
-from ds_video.api.exceptions import ApiError
+from ds_video.api.exceptions import ApiError, SessionExpiredError
 from ds_video.api.file_station import FileStationClient
 
 
@@ -104,8 +105,9 @@ def test_get_stream_url_includes_sid_and_token() -> None:
     assert "mode=open" in url
     assert "_sid=SID123" in url
     assert "SynoToken=TOKEN456" in url
-    # Path must be URL-encoded (spaces/unicode), not embedded raw.
-    assert "movie.mp4" in url
+    # The Chinese path segment must be percent-encoded, not embedded raw.
+    assert "电影" not in url
+    assert quote("/video/电影/movie.mp4") in url
 
 
 def test_get_stream_url_raises_when_download_api_unavailable() -> None:
@@ -115,3 +117,41 @@ def test_get_stream_url_raises_when_download_api_unavailable() -> None:
 
     with pytest.raises(ApiError):
         client.get_stream_url("/video/movie.mp4")
+
+
+def test_list_shares_raises_api_error_on_success_false() -> None:
+    fake = FakeFileStation(share_response={"success": False, "error": {"code": 100}})
+    client = make_client(fake)
+
+    with pytest.raises(ApiError) as excinfo:
+        client.list_shares()
+    assert excinfo.value.error_code == 100
+    assert excinfo.value.api_name == "SYNO.FileStation.List"
+
+
+def test_list_folder_raises_api_error_on_success_false() -> None:
+    fake = FakeFileStation(file_list_response={"success": False, "error": {"code": 408}})
+    client = make_client(fake)
+
+    with pytest.raises(ApiError) as excinfo:
+        client.list_folder("/video")
+    assert excinfo.value.error_code == 408
+    assert excinfo.value.api_name == "SYNO.FileStation.List"
+
+
+@pytest.mark.parametrize("error_code", [105, 119])
+def test_list_folder_raises_session_expired_on_session_error_codes(error_code: int) -> None:
+    fake = FakeFileStation(file_list_response={"success": False, "error": {"code": error_code}})
+    client = make_client(fake)
+
+    with pytest.raises(SessionExpiredError):
+        client.list_folder("/video")
+
+
+@pytest.mark.parametrize("error_code", [105, 119])
+def test_list_shares_raises_session_expired_on_session_error_codes(error_code: int) -> None:
+    fake = FakeFileStation(share_response={"success": False, "error": {"code": error_code}})
+    client = make_client(fake)
+
+    with pytest.raises(SessionExpiredError):
+        client.list_shares()

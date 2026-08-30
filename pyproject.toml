@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ds-video"
 version = "0.1.0"
-description = "Cross-platform (macOS/Linux) desktop client to browse and play videos from Synology DSM 7.2 Video Station"
+description = "Cross-platform (macOS/Linux) desktop client to browse and play videos from Synology DSM 7.2 via File Station"
 requires-python = ">=3.10"
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,6 +19,7 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pytest-mock>=3",
+    "requests>=2",
 ]
 
 [project.scripts]

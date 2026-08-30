@@ -31,6 +31,13 @@ class DsmConnectionSettings:
 
 def _load_or_create_key(key_path: Path) -> bytes:
     if key_path.exists():
+        # Re-assert 0600 on every load too, not just at creation time: the
+        # file could have been copied/extracted (e.g. `cp`, backup restore)
+        # with looser permissions than it was created with.
+        try:
+            key_path.chmod(0o600)
+        except OSError:
+            pass
         return key_path.read_bytes()
     key = Fernet.generate_key()
     key_path.write_bytes(key)
@@ -72,7 +79,7 @@ def load_settings(config_path: Optional[Path] = None, key_path: Optional[Path] =
         return None
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    fernet = Fernet(key_path.read_bytes())
+    fernet = Fernet(_load_or_create_key(key_path))
     try:
         password = fernet.decrypt(payload["password"].encode("ascii")).decode("utf-8")
     except InvalidToken as exc:

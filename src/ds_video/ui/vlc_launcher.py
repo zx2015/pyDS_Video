@@ -23,6 +23,7 @@ instead of ours. See docs/design.md's 2026-08-29 change notes.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -46,7 +47,9 @@ def _find_vlc_executable() -> str | None:
         return found
     if sys.platform == "darwin":
         mac_path = "/Applications/VLC.app/Contents/MacOS/VLC"
-        if shutil.which(mac_path):
+        # shutil.which() only searches $PATH entries; a full path like this
+        # must be checked directly for existence + executability instead.
+        if os.path.isfile(mac_path) and os.access(mac_path, os.X_OK):
             return mac_path
     return None
 

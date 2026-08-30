@@ -30,4 +30,10 @@ def configure_logging(level: int = logging.INFO) -> None:
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
+    # These third-party HTTP libraries are chatty at INFO (one line per
+    # request), which drowns out ds_video's own logs; only their warnings
+    # and above are useful here.
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+
     _CONFIGURED = True

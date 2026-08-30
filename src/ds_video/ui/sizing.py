@@ -14,7 +14,8 @@ def apply_preferred_size(
 ) -> None:
     """Resize ``widget`` to a fixed preferred size, clamped down to the
     primary screen's available size on smaller displays so the window never
-    opens larger than the screen it's shown on.
+    opens larger than the screen it's shown on, and centered on that screen
+    rather than left at Qt's default top-left placement.
     """
     screen = QApplication.primaryScreen()
     if screen is None:
@@ -24,3 +25,6 @@ def apply_preferred_size(
     width = min(preferred_width, geometry.width())
     height = min(preferred_height, geometry.height())
     widget.resize(width, height)
+    x = geometry.x() + (geometry.width() - width) // 2
+    y = geometry.y() + (geometry.height() - height) // 2
+    widget.move(x, y)

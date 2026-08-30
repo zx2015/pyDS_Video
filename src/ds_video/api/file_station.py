@@ -29,7 +29,13 @@ from synology_api.exceptions import (
     SynoConnectionError,
 )
 
-from ds_video.api.exceptions import ApiError, AuthError
+from ds_video.api.exceptions import ApiError, AuthError, SessionExpiredError
+
+# DSM error codes that mean "the session is no longer valid" rather than a
+# generic API failure (confirmed against real-device testing, see
+# docs/design.md 2.2's note on SynoToken/_sid handling): 105 is the common
+# "session timeout" code, 119 is "SID not found" (session expired/invalid).
+_SESSION_EXPIRED_CODES = {105, 119}
 
 
 @dataclass
@@ -76,12 +82,36 @@ class FileStationClient:
 
     # -- browsing --------------------------------------------------------
 
+    @staticmethod
+    def _check_success(data: dict[str, Any], context: str, api_name: str | None = None) -> None:
+        """Raise if a File Station response has ``"success": false``.
+
+        DSM returns HTTP 200 with a body like ``{"success": false, "error":
+        {"code": ...}}`` on failure, so a missing ``"data"`` key must be
+        treated as an error, not silently ignored (it would otherwise look
+        like "this folder is empty"). ``api_name`` is threaded through so
+        callers/UI can eventually special-case behavior per API (e.g. a
+        119 on the Download API vs. the List API may warrant different
+        follow-up actions).
+        """
+        if data.get("success", True):
+            return
+        error_code = data.get("error", {}).get("code")
+        if error_code in _SESSION_EXPIRED_CODES:
+            raise SessionExpiredError(f"{context}: DSM session expired (error code {error_code}).")
+        raise ApiError(
+            f"{context}: DSM returned an error (code {error_code}).",
+            api_name=api_name,
+            error_code=error_code,
+        )
+
     def list_shares(self) -> list[FileEntry]:
         """Return the top-level shared folders (tree root nodes)."""
         try:
             data = self._fs.get_list_share()
         except (FileStationError, SynoConnectionError, HTTPError) as exc:
-            raise ApiError(f"Failed to list shared folders: {exc}") from exc
+            raise ApiError(f"Failed to list shared folders: {exc}", api_name="SYNO.FileStation.List") from exc
+        self._check_success(data, "Failed to list shared folders", api_name="SYNO.FileStation.List")
         shares = data.get("data", {}).get("shares", [])
         return [
             FileEntry(path=s["path"], name=s.get("name", s["path"]), is_folder=True, raw=s)
@@ -93,7 +123,8 @@ class FileStationClient:
         try:
             data = self._fs.get_file_list(path)
         except (FileStationError, SynoConnectionError, HTTPError) as exc:
-            raise ApiError(f"Failed to list folder '{path}': {exc}") from exc
+            raise ApiError(f"Failed to list folder '{path}': {exc}", api_name="SYNO.FileStation.List") from exc
+        self._check_success(data, f"Failed to list folder '{path}'", api_name="SYNO.FileStation.List")
         files = data.get("data", {}).get("files", [])
         return [
             FileEntry(path=f["path"], name=f.get("name", f["path"]), is_folder=bool(f.get("isdir")), raw=f)
@@ -113,7 +144,7 @@ class FileStationClient:
         try:
             info = self._fs.file_station_list[api_name]
         except KeyError as exc:
-            raise ApiError(f"API '{api_name}' is not available on this DSM.") from exc
+            raise ApiError(f"API '{api_name}' is not available on this DSM.", api_name=api_name) from exc
 
         session = self._fs.session
         return (
