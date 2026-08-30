@@ -22,7 +22,7 @@
 - **网络环境**：仅需支持局域网内访问 DSM，无需支持公网/QuickConnect 远程访问。
 - **支持平台**：macOS 与 Linux（**不需要**支持 Windows）。
 - **GUI 框架**：PyQt6。
-- **播放后端**：优先使用 `python-vlc`（基于 VLC）作为视频播放引擎。
+- **播放后端**：通过 `subprocess.Popen` 直接调用系统安装的 VLC 独立进程播放（不嵌入 VLC 到 Qt 窗口，不依赖 `python-vlc`）。
 - **打包分发**：暂不需要打包为独立可执行文件（如 PyInstaller），能在 Python 环境中直接运行即可。
 
 ## 4. 测试要求

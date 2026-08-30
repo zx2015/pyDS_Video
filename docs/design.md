@@ -36,18 +36,18 @@
 ### 1.1 模块划分
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                       ui (PyQt6)                         │
-│  LoginWindow │ MainWindow(目录树+文件列表) │ VlcLauncher（无窗口） │
-└───────────────┬───────────────────────────┬──────────────┘
-                │ 调用                      │ 调用
-                ▼                            ▼
-┌───────────────────────────┐   ┌───────────────────────────┐
-│  api (FileStation 客户端)   │   │  player (播放后端封装)     │
-│  - 登录/会话（复用 synology- │   │  - VlcPlayerBackend       │
-│    api 内置的 FileStation） │   │    (基于 python-vlc)      │
-│  - 共享文件夹/目录/文件列表   │   │  - 统一播放控制接口        │
-│  - 拼装带鉴权信息的流式 URL   │   └───────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       ui (PyQt6)                             │
+│  LoginWindow │ MainWindow(目录树+文件列表) │ VlcLauncher(无窗口) │
+└───────────────┬───────────────────────────────┬──────────────┘
+                │ 调用                          │ 调用
+                ▼                               ▼
+┌───────────────────────────┐       ┌───────────────────────────┐
+│  api (FileStation 客户端)   │       │  VlcLauncher              │
+│  - 登录/会话（复用 synology- │       │  - 获取流媒体直链            │
+│    api 内置的 FileStation） │       │  - 检测系统 VLC 路径         │
+│  - 共享文件夹/目录/文件列表   │       │  - subprocess.Popen 启动   │
+│  - 拼装带鉴权信息的流式 URL   │       └───────────────────────────┘
 └───────────────┬───────────┘
                 │ HTTP(S) / WebAPI
                 ▼
@@ -93,21 +93,18 @@
 ## 3. 播放器技术选型
 
 - **GUI 框架**：PyQt6。
-- **播放引擎**：`python-vlc`（基于系统安装的 VLC 库/`libvlc`）。
-  - 通过 `vlc.Instance()` 创建播放实例，`media_player_new()` 播放 `api` 返回的流媒体 URL。
-  - 在 PyQt6 界面中，通过原生窗口句柄（macOS: `set_nsobject`；Linux: `set_xwindow`）把 VLC 视频输出嵌入到 Qt Widget 中。
-- **依赖前提**：用户系统需已安装 VLC（提供 `libvlc`），随需求确认，暂不做打包/自动安装处理。
-- **播放控制接口**（`player/backend.py` 中定义抽象接口，当前唯一实现为 VLC）：
-  - `play(url)` / `pause()` / `resume()` / `stop()`
-  - `seek(position_ms)` / `get_position()` / `get_duration()`
-  - `set_volume(level)`
+- **播放方案**：通过 `subprocess.Popen` 直接调用系统安装的 VLC 可执行文件（`vlc`），将 `api` 返回的流媒体直链作为命令行参数传入。不使用 `python-vlc` 嵌入，也不将 VLC 视频输出嵌入 Qt 窗口。
+  - 选择理由：在目标 Linux 桌面环境（原生 Wayland、无 `xcb` 平台插件）下，无论嵌入还是走 python-vlc 自带视频输出，libvlc 都会卡在等待而非快速失败，导致整个应用假死。直接调用系统 VLC 进程可完全避免此问题，代价是播放控制在 VLC 自己的窗口中操作。
+  - `VlcLauncher`（`ui/vlc_launcher.py`）负责：获取流媒体直链 → 检测系统 VLC 路径（`shutil.which` + macOS bundle 路径）→ `subprocess.Popen([vlc_path, url])`。
+  - 每次双击独立启动一个 VLC 进程，不追踪/终止先前的进程。
+- **依赖前提**：用户系统需已安装 VLC，随需求确认，暂不做打包/自动安装处理。未安装时应用会弹窗提示安装方式。
 
 ## 4. 跨平台注意事项（macOS / Linux）
 
 | 方面 | macOS | Linux |
 |---|---|---|
-| VLC 依赖 | 需安装 VLC.app 或通过 Homebrew 安装 libvlc | 需安装发行版对应的 `vlc`/`libvlc` 包 |
-| 视频嵌入窗口 | 使用 `media_player.set_nsobject(int(widget.winId()))` | 使用 `media_player.set_xwindow(int(widget.winId()))`（依赖 X11，Wayland 下可能需要 XWayland 兼容） |
+| VLC 依赖 | 需安装 VLC.app（`/Applications/VLC.app`）或通过 Homebrew 安装（`brew install --cask vlc`） | 需安装发行版对应的 `vlc` 包（如 `sudo apt install vlc`） |
+| VLC 路径检测 | `shutil.which("vlc")` + `/Applications/VLC.app/Contents/MacOS/VLC` 回退 | `shutil.which("vlc")` |
 | 凭证存储路径 | 遵循 `~/Library/Application Support/ds_video/` | 遵循 `~/.config/ds_video/`（或 XDG 规范） |
 | PyQt6 安装 | pip 安装即可，Apple Silicon 需确认 wheel 可用性 | pip 安装，注意部分发行版需要额外系统库（如 `libxcb`） |
 
@@ -128,9 +125,10 @@
 ## 7. 测试策略
 
 ### 7.1 单元测试（`tests/unit`）
-- 覆盖 `api` 层：mock HTTP 响应（如使用 `responses` 或 `unittest.mock`），验证登录、目录解析、流媒体 URL 拼装、错误码映射等逻辑，不依赖真实网络。
-- 覆盖 `config` 层：加密/解密、配置文件读写的正确性。
-- 覆盖 `player` 抽象接口：对播放控制逻辑（如状态切换）做可 mock 部分的测试；`python-vlc` 底层调用可通过接口抽象后 mock 掉。
+- 覆盖 `api` 层：使用 `object.__new__()` 绕过登录 + `FakeFileStation` stub，验证目录解析、流媒体 URL 拼装、错误码映射（`success: false` → `ApiError`，codes 105/119 → `SessionExpiredError`）等逻辑，不依赖真实网络。
+- 覆盖 `config` 层：加密/解密、配置文件读写、权限设置的正确性（使用 `tmp_path` 临时目录）。
+- 覆盖 `ui/vlc_launcher`：VLC 路径检测逻辑（`shutil.which`、macOS bundle 路径回退、未安装场景）。
+- 覆盖 `ui/main_window`：视频扩展名过滤逻辑（`_is_video_file`）。
 
 ### 7.2 集成测试（`tests/integration`）
 - 针对真实或模拟的 DSM 环境（用户提供测试 NAS，或使用可控的 mock WebAPI 服务）进行端到端联调：登录 → 获取目录 → 获取流媒体 URL 是否可达。
@@ -139,9 +137,9 @@
   - `DS_VIDEO_TEST_HOST`、`DS_VIDEO_TEST_PORT`、`DS_VIDEO_TEST_USERNAME`、`DS_VIDEO_TEST_PASSWORD`
   - 未设置这些环境变量时，集成测试自动跳过（`pytest.mark.skipif`）。
 
-### 7.3 测试工具链（待确认）
-- 建议使用 `pytest` 作为测试框架，`pytest-mock`/`responses` 辅助 mock HTTP。
-- 依赖管理建议使用 `pyproject.toml` + `pip`（或 `poetry`，具体在确认设计后落地）。
+### 7.3 测试工具链
+- 使用 `pytest` 作为测试框架，`pytest-mock` 辅助 mock（已在 `pyproject.toml` 的 `[project.optional-dependencies] dev` 中声明）。
+- 依赖管理使用 `pyproject.toml` + `pip`。
 
 ## 8. 确认记录
 
