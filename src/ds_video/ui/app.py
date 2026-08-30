@@ -47,8 +47,8 @@ class AppController:
         self.login_window.login_succeeded.connect(self._on_login_succeeded)
         self.login_window.show()
 
-    def _on_login_succeeded(self, client: FileStationClient, _settings: DsmConnectionSettings) -> None:
-        self.main_window = MainWindow(client)
+    def _on_login_succeeded(self, client: FileStationClient, settings: DsmConnectionSettings) -> None:
+        self.main_window = MainWindow(client, settings)
         self.main_window.file_activated.connect(lambda path, name: self._on_file_activated(client, path, name))
         self.main_window.show()
         if self.login_window is not None:
@@ -59,7 +59,13 @@ class AppController:
         # a video should just open it in VLC directly. Errors (couldn't get
         # the stream URL, VLC missing, VLC failed to start) still surface via
         # a message box from VlcLauncher itself.
-        VlcLauncher(client, parent=self.main_window).play_file(path)
+        # Use the MainWindow's current client rather than the one captured
+        # at login time: _reconnect() may have replaced it with a fresh
+        # session (e.g. after the DSM device rebooted), and the stale
+        # client's session would no longer be valid for building a stream
+        # URL.
+        active_client = self.main_window.client if self.main_window is not None else client
+        VlcLauncher(active_client, parent=self.main_window).play_file(path)
 
 
 def main() -> int:

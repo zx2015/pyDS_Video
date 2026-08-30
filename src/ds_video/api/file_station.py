@@ -131,6 +131,22 @@ class FileStationClient:
             for f in files
         ]
 
+    def ping(self) -> None:
+        """Lightweight liveness check for the heartbeat timer.
+
+        Reuses the same (already small) ``SYNO.FileStation.List`` call as
+        :meth:`list_shares`, but discards the result -- the point isn't the
+        share list, it's confirming the session is still valid and DSM is
+        still reachable. Raises the same ``ApiError``/``SessionExpiredError``
+        as any other call so ``MainWindow``'s heartbeat handler can reuse
+        the existing reconnect machinery.
+        """
+        try:
+            data = self._fs.get_list_share()
+        except (FileStationError, SynoConnectionError, HTTPError) as exc:
+            raise ApiError(f"Heartbeat check failed: {exc}", api_name="SYNO.FileStation.List") from exc
+        self._check_success(data, "Heartbeat check failed", api_name="SYNO.FileStation.List")
+
     # -- streaming ---------------------------------------------------------
 
     def get_stream_url(self, path: str) -> str:

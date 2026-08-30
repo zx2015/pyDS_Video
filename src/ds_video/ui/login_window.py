@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QFormLayout,
@@ -15,40 +15,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ds_video.api import AuthError, FileStationClient
+from ds_video.api import FileStationClient
 from ds_video.config import DsmConnectionSettings, load_settings, save_settings
 from ds_video.ui.theme import make_app_icon
-
-
-class _LoginWorker(QThread):
-    """Runs the (blocking) DSM login call off the Qt UI thread."""
-
-    succeeded = pyqtSignal(object)  # FileStationClient
-    failed = pyqtSignal(str)
-
-    def __init__(self, settings: DsmConnectionSettings) -> None:
-        super().__init__()
-        self._settings = settings
-
-    def run(self) -> None:
-        try:
-            client = FileStationClient(
-                ip_address=self._settings.host,
-                port=self._settings.port,
-                username=self._settings.username,
-                password=self._settings.password,
-                secure=self._settings.secure,
-            )
-        except AuthError as exc:
-            self.failed.emit(str(exc))
-            return
-        except Exception as exc:  # noqa: BLE001 - last line of defense: an
-            # exception escaping a QThread can abort the whole PyQt process
-            # instead of just failing this login attempt, so nothing may
-            # propagate out of run().
-            self.failed.emit(f"未预期的错误：{exc}")
-            return
-        self.succeeded.emit(client)
+from ds_video.ui.workers import LoginWorker
 
 
 class LoginWindow(QWidget):
@@ -59,7 +29,7 @@ class LoginWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("ds_video - 登录 DSM")
-        self._worker: _LoginWorker | None = None
+        self._worker: LoginWorker | None = None
         self._auto_connecting = False
 
         # -- header: logo mark + title/subtitle ---------------------------
@@ -171,7 +141,7 @@ class LoginWindow(QWidget):
         self._start_login(settings)
 
     def _start_login(self, settings: DsmConnectionSettings) -> None:
-        self._worker = _LoginWorker(settings)
+        self._worker = LoginWorker(settings)
         self._worker.succeeded.connect(lambda client: self._on_login_succeeded(client, settings))
         self._worker.failed.connect(self._on_login_failed)
         self._worker.start()

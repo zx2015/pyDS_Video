@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -31,7 +31,19 @@ from PyQt6.QtWidgets import (
 )
 
 from ds_video.api import ApiError, FileEntry, FileStationClient, SessionExpiredError
+from ds_video.config import DsmConnectionSettings
 from ds_video.ui.sizing import apply_preferred_size
+from ds_video.ui.workers import HeartbeatWorker, LoginWorker
+
+# How often to check that the DSM session is still alive/reachable, in
+# milliseconds. Frequent enough to notice a reboot within about a minute,
+# infrequent enough not to add meaningful load to DSM or the network.
+_HEARTBEAT_INTERVAL_MS = 30_000
+
+# Delay before the very first heartbeat check after startup, so a DSM that
+# reboots moments after login is caught quickly instead of waiting a full
+# _HEARTBEAT_INTERVAL_MS.
+_HEARTBEAT_INITIAL_DELAY_MS = 5_000
 
 # Shared folder names treated as "the video library" — only these (and their
 # subfolders) are shown by default; other shared folders (photo, docs, etc.)
@@ -59,12 +71,21 @@ class MainWindow(QMainWindow):
 
     _PATH_ROLE = Qt.ItemDataRole.UserRole
 
-    def __init__(self, client: FileStationClient) -> None:
+    def __init__(self, client: FileStationClient, settings: DsmConnectionSettings) -> None:
         super().__init__()
         self.setWindowTitle("ds_video - File Station")
         self._client = client
+        # Kept so a dropped session (e.g. the DSM device rebooting) can be
+        # re-authenticated without the user having to quit and relaunch the
+        # whole app -- see _reconnect().
+        self._settings = settings
         self._current_folder_path: str | None = None
         self._loading = False
+        self._reconnecting = False
+        self._reconnect_silent = False
+        self._reconnect_worker: LoginWorker | None = None
+        self._heartbeat_in_flight = False
+        self._heartbeat_worker: HeartbeatWorker | None = None
 
         style = QApplication.instance().style() if QApplication.instance() else self.style()
         self._folder_icon = style.standardIcon(QStyle.StandardPixmap.SP_DirIcon)
@@ -135,6 +156,25 @@ class MainWindow(QMainWindow):
 
         self._load_shares()
 
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.timeout.connect(self._run_heartbeat)
+        self._heartbeat_timer.start(_HEARTBEAT_INTERVAL_MS)
+        # Also check shortly after startup rather than waiting a full
+        # interval for the first tick, so a DSM that reboots right after
+        # login is noticed within seconds instead of only when the user
+        # happens to click around and hits a load error.
+        QTimer.singleShot(_HEARTBEAT_INITIAL_DELAY_MS, self._run_heartbeat)
+
+    @property
+    def client(self) -> FileStationClient:
+        """The currently active DSM session.
+
+        Exposed so callers (e.g. AppController, when launching VLC) always
+        use the live client instead of one captured before a _reconnect()
+        replaced it with a fresh session.
+        """
+        return self._client
+
     # -- chrome ------------------------------------------------------------
 
     def _build_toolbar(self, style) -> None:
@@ -143,10 +183,16 @@ class MainWindow(QMainWindow):
         toolbar.setIconSize(toolbar.iconSize())
         self.addToolBar(toolbar)
 
-        refresh_button = QPushButton("刷新")
-        refresh_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
-        refresh_button.clicked.connect(self._on_refresh_clicked)
-        toolbar.addWidget(refresh_button)
+        self._refresh_button = QPushButton("刷新")
+        self._refresh_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self._refresh_button.clicked.connect(self._on_refresh_clicked)
+        toolbar.addWidget(self._refresh_button)
+
+        self._reconnect_button = QPushButton("重新连接")
+        self._reconnect_button.setToolTip("DSM 重启或断线后，点击此处重新登录并恢复浏览")
+        self._reconnect_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self._reconnect_button.clicked.connect(lambda: self._reconnect())
+        toolbar.addWidget(self._reconnect_button)
 
     def _on_refresh_clicked(self) -> None:
         self._tree.clear()
@@ -159,20 +205,137 @@ class MainWindow(QMainWindow):
         self._status_hint.showMessage("正在刷新视频目录…")
         self._load_shares()
 
-    # -- error handling ----------------------------------------------------
+    # -- error handling / reconnect -----------------------------------------
 
     def _handle_load_error(self, exc: Exception, message: str) -> None:
-        """Show one dialog for both "API returned an error" and "the DSM
-        session expired" cases, since the latter needs a clearer next step
-        (re-login) rather than just "try again"."""
+        """Offer to reconnect for any failure that could mean "DSM is
+        temporarily unreachable" -- both a stale/expired session (DSM
+        rebooted, kicking out old sessions) and a plain connection failure
+        (DSM still booting, network hiccup, ...) look the same from the
+        user's side: "it stopped working, let me try again" -- so both get
+        the same recovery path instead of forcing a full app restart.
+        """
         if isinstance(exc, SessionExpiredError):
-            QMessageBox.critical(
-                self,
-                "会话已过期",
-                f"{message}：DSM 登录会话已过期或失效，请重新启动应用并登录。",
-            )
+            detail = f"{message}：DSM 登录会话已过期或失效（例如 DSM 刚刚重启）。"
         else:
-            QMessageBox.critical(self, "加载失败", f"{message}：{exc}")
+            detail = f"{message}：{exc}"
+        response = QMessageBox.question(
+            self,
+            "连接出现问题",
+            f"{detail}\n\n是否立即重新连接 DSM？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if response == QMessageBox.StandardButton.Yes:
+            self._reconnect()
+
+    def _reconnect(self, *, silent: bool = False) -> None:
+        """Re-authenticate with the last-used connection settings and, on
+        success, refresh the tree (and the currently open folder, if any)
+        so browsing can resume without restarting the app.
+
+        ``silent=True`` is used by the heartbeat timer: a failure there
+        should not pop up a dialog every ~30s while DSM is still rebooting,
+        it should just quietly retry on the next heartbeat tick instead.
+        """
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        self._reconnect_silent = silent
+        self._refresh_button.setEnabled(False)
+        self._reconnect_button.setEnabled(False)
+        self._reconnect_button.setText("正在重新连接...")
+        self._status_hint.showMessage("正在重新连接 DSM…")
+
+        self._reconnect_worker = LoginWorker(self._settings)
+        self._reconnect_worker.succeeded.connect(self._on_reconnect_succeeded)
+        self._reconnect_worker.failed.connect(self._on_reconnect_failed)
+        self._reconnect_worker.finished.connect(self._reconnect_worker.deleteLater)
+        self._reconnect_worker.start()
+
+    def _on_reconnect_succeeded(self, client: FileStationClient) -> None:
+        self._client = client
+        self._reconnecting = False
+        self._refresh_button.setEnabled(True)
+        self._reconnect_button.setEnabled(True)
+        self._reconnect_button.setText("重新连接")
+        self._status_hint.showMessage("已重新连接 DSM，正在刷新目录…", 4000)
+
+        folder_to_restore = self._current_folder_path
+        # setUpdatesEnabled(False) batches the clear+repopulate into a
+        # single repaint instead of flashing an empty tree/list for one
+        # frame in between.
+        self._tree.setUpdatesEnabled(False)
+        self._file_list.setUpdatesEnabled(False)
+        try:
+            self._tree.clear()
+            self._file_list.clear()
+            self._current_folder_path = None
+            self._load_shares()
+            if folder_to_restore:
+                self._load_file_list(folder_to_restore)
+        finally:
+            self._tree.setUpdatesEnabled(True)
+            self._file_list.setUpdatesEnabled(True)
+
+    def _on_reconnect_failed(self, message: str) -> None:
+        self._reconnecting = False
+        self._refresh_button.setEnabled(True)
+        self._reconnect_button.setEnabled(True)
+        self._reconnect_button.setText("重新连接")
+        if self._reconnect_silent:
+            # Triggered automatically by the heartbeat timer: DSM is likely
+            # still rebooting. Don't nag with a dialog every ~30s -- just
+            # report it in the status bar and let the next heartbeat tick
+            # retry on its own.
+            self._status_hint.showMessage(f"自动重新连接失败，将稍后自动重试：{message}", 6000)
+            return
+        self._status_hint.showMessage("重新连接失败", 5000)
+        response = QMessageBox.question(
+            self,
+            "重新连接失败",
+            f"重新连接 DSM 失败：{message}\n\n是否再次尝试？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if response == QMessageBox.StandardButton.Yes:
+            self._reconnect()
+
+    def _run_heartbeat(self) -> None:
+        """Periodic liveness check (see ``_HEARTBEAT_INTERVAL_MS``).
+
+        Skips this tick entirely if a reconnect or a previous heartbeat
+        check is still in flight, so DSM rebooting slowly never piles up
+        multiple overlapping background threads.
+        """
+        if self._reconnecting or self._heartbeat_in_flight:
+            return
+        self._heartbeat_in_flight = True
+        self._heartbeat_worker = HeartbeatWorker(self._client)
+        self._heartbeat_worker.ok.connect(self._on_heartbeat_ok)
+        self._heartbeat_worker.failed.connect(self._on_heartbeat_failed)
+        self._heartbeat_worker.finished.connect(self._heartbeat_worker.deleteLater)
+        self._heartbeat_worker.start()
+
+    def _on_heartbeat_ok(self) -> None:
+        self._heartbeat_in_flight = False
+
+    def _on_heartbeat_failed(self, exc: Exception) -> None:
+        self._heartbeat_in_flight = False
+        if self._reconnecting:
+            return
+        self._status_hint.showMessage("检测到与 DSM 的连接已断开，正在自动重新连接…", 5000)
+        self._reconnect(silent=True)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # Stop background work before the window (and its client/settings)
+        # go away, so an in-flight heartbeat/reconnect thread doesn't fire
+        # a signal into an already-destroyed widget.
+        self._heartbeat_timer.stop()
+        for worker in (self._heartbeat_worker, self._reconnect_worker):
+            if worker is not None and worker.isRunning():
+                worker.wait(2000)
+        super().closeEvent(event)
 
     def _make_tree_item(self, entry: FileEntry) -> QTreeWidgetItem:
         """Build a tree node for a folder entry (shared by the top-level
