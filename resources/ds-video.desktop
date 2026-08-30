@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DS Video
+Comment=浏览并播放群晖 DSM File Station 中的视频
+Exec=/path/to/ds_video/.venv/bin/ds-video
+Icon=ds-video
+Terminal=false
+Categories=AudioVideo;Video;Player;
+StartupWMClass=ds-video
